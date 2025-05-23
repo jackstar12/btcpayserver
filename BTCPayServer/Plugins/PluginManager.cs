@@ -6,6 +6,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.Loader;
 using System.Text.RegularExpressions;
 using BTCPayServer.Abstractions.Contracts;
 using BTCPayServer.Configuration;
@@ -59,6 +60,60 @@ namespace BTCPayServer.Plugins
             }
             pluginName = null;
             return false;
+        }
+
+        class PluginLoadContext : AssemblyLoadContext
+        {
+            private readonly List<AssemblyDependencyResolver> _resolvers = new();
+            private readonly AssemblyLoadContext parent;
+            private readonly Dictionary<string, Assembly> _pluginAssemblies = new();
+
+            public PluginLoadContext(AssemblyLoadContext parent, params string[] pluginPaths)
+            {
+                foreach (var path in pluginPaths)
+                {
+                    _resolvers.Add(new AssemblyDependencyResolver(path));
+                }
+                this.parent = parent;
+            }
+
+
+            public void AddAssembly(Assembly assembly)
+            {
+                _pluginAssemblies[assembly.GetName().FullName] = assembly;
+            }
+
+            protected override Assembly Load(AssemblyName assemblyName)
+            {
+                if (_pluginAssemblies.TryGetValue(assemblyName.FullName, out var assembly)) {
+                    return assembly;
+                }
+                foreach (var resolver in _resolvers)
+                {
+                    string assemblyPath = resolver.ResolveAssemblyToPath(assemblyName);
+                    if (assemblyPath != null)
+                    {
+                        assembly = parent.LoadFromAssemblyPath(assemblyPath);
+                        _pluginAssemblies[assemblyName.FullName] = assembly;
+                        return assembly;
+                    }
+                }
+                return null;
+            }
+
+            protected override IntPtr LoadUnmanagedDll(string unmanagedDllName)
+            {
+                foreach (var resolver in _resolvers)
+                {
+                    string libraryPath = resolver.ResolveUnmanagedDllToPath(unmanagedDllName);
+                    if (libraryPath != null)
+                    {
+                        return LoadUnmanagedDllFromPath(libraryPath);
+                    }
+                }
+
+                return IntPtr.Zero;
+            }
         }
 
         public static IMvcBuilder AddPlugins(this IMvcBuilder mvcBuilder, IServiceCollection serviceCollection,
@@ -155,6 +210,14 @@ namespace BTCPayServer.Plugins
 
             ReorderPlugins(pluginsFolder, pluginsToLoad);
 			var crashedPlugins = new List<string>();
+            var pluginPaths = pluginsToLoad.Select(p => p.PluginFilePath).ToArray();
+            
+            var ctx = new PluginLoadContext(AssemblyLoadContext.Default, pluginsToLoad.Select(p => p.PluginFilePath).ToArray());
+
+            AssemblyLoadContext.Default.Resolving += (context, name) => {
+                return ctx.LoadFromAssemblyName(name);
+            };
+
             foreach (var toLoad in pluginsToLoad)
             {
                 if (!loadedPluginIdentifiers.Add(toLoad.PluginIdentifier))
@@ -166,12 +229,13 @@ namespace BTCPayServer.Plugins
                         toLoad.PluginFilePath, // create a plugin from for the .dll file
                         config =>
                         {
-
-                            // this ensures that the version of MVC is shared between this app and the plugin
+                            config.DefaultContext = ctx;
                             config.PreferSharedTypes = true;
                             config.IsUnloadable = false;
                         });
                     var pluginAssembly = plugin.LoadDefaultAssembly();
+                    ctx.AddAssembly(pluginAssembly);
+                    logger.LogInformation($"Plugin assembly loaded: {pluginAssembly.GetName()}");
 
                     var p = GetPluginInstanceFromAssembly(toLoad.PluginIdentifier, pluginAssembly);
                     if (p == null)
